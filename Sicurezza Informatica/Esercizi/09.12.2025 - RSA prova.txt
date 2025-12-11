@@ -1,0 +1,1076 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import multiprocessing
+import sys
+import json
+from pathlib import Path
+from datetime import datetime
+import threading
+import time
+
+DB_PATH = Path(__file__).parent / "db.txt"
+
+CLIENTS = []
+SERVERS = []
+
+# Manager globale per sincronizzazione tra processi
+manager = None
+shared_servers = None
+shared_clients = None
+
+def init_multiprocessing():
+    """Inizializza il manager multiprocessing"""
+    global manager, shared_servers, shared_clients
+    if manager is None:
+        manager = multiprocessing.Manager()
+        shared_servers = manager.dict()
+        shared_clients = manager.dict()
+
+def save_db():
+    """Salva client e server nel file db.txt"""
+    data = {
+        "clients": [{"name": c.name, "password": c.password, "client_id": c.client_id} for c in CLIENTS],
+        "servers": [{"name": s.name, "password": s.password, "server_ip": s.server_ip} for s in SERVERS]
+    }
+    with DB_PATH.open("w") as f:
+        json.dump(data, f, indent=2)
+
+def load_db():
+    """Carica client e server dal file db.txt"""
+    global CLIENTS, SERVERS
+    if DB_PATH.exists():
+        try:
+            with DB_PATH.open("r") as f:
+                data = json.load(f)
+            CLIENTS = [Client(c["name"], c["password"], c["client_id"]) for c in data.get("clients", [])]
+            SERVERS = [Server(s["name"], s["password"], s["server_ip"]) for s in data.get("servers", [])]
+            
+            # Sincronizza con le strutture condivise
+            if shared_servers is not None and shared_clients is not None:
+                for s in SERVERS:
+                    shared_servers[s.server_ip] = {
+                        'name': s.name,
+                        'password': s.password,
+                        'server_ip': s.server_ip,
+                        'connected_clients': [],
+                        'logs': [],
+                        'intercepted_messages': [],
+                        'client_messages': {},
+                        'server_status': 'online'
+                    }
+                for c in CLIENTS:
+                    shared_clients[c.client_id] = {
+                        'name': c.name,
+                        'password': c.password,
+                        'client_id': c.client_id
+                    }
+        except:
+            pass
+
+class User:
+    def __init__(self, name, password):
+        self.name = name
+        self.password = password
+        self.data = None
+    def display_info(self):
+        return f"User: {self.name}, Password: {self.password}"
+
+class Client(User):
+    def __init__(self, name, password, client_id):
+        super().__init__(name, password)
+        self.client_id = client_id
+class Server(User):
+    def __init__(self, name, password, server_ip):
+        super().__init__(name, password)
+        self.server_ip = server_ip
+        self.logs = []
+        self.connected_clients = []
+        self.intercepted_messages = []
+        self.client_messages = {}  # Dizionario per i messaggi dei client
+        self.last_update = time.time()
+        
+    def display_info(self):
+        base_info = super().display_info()
+        return f"{base_info}, Server IP: {self.server_ip}"
+        
+    def add_log(self, msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {msg}"
+        self.logs.append(log_entry)
+        self.last_update = time.time()
+        
+        # Sincronizza con struttura condivisa se disponibile (senza sovrascrivere tutto)
+        if shared_servers is not None and self.server_ip in shared_servers:
+            server_data = dict(shared_servers[self.server_ip])
+            # Aggiunge il nuovo log alla lista condivisa senza sovrascrivere
+            if log_entry not in server_data['logs']:
+                server_data['logs'].append(log_entry)
+                shared_servers[self.server_ip] = server_data
+        
+    def add_message(self, sender, recipient, msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        message_entry = f"[{timestamp}] {sender} -> {recipient}: {msg}"
+        self.intercepted_messages.append(message_entry)
+        self.last_update = time.time()
+        
+        # Sincronizza con struttura condivisa se disponibile (senza sovrascrivere tutto)
+        if shared_servers is not None and self.server_ip in shared_servers:
+            server_data = dict(shared_servers[self.server_ip])
+            # Aggiunge il nuovo messaggio alla lista condivisa senza sovrascrivere
+            if message_entry not in server_data['intercepted_messages']:
+                server_data['intercepted_messages'].append(message_entry)
+                shared_servers[self.server_ip] = server_data
+    
+    def get_connected_client_names(self):
+        return [c["name"] for c in self.connected_clients]
+        
+    def deliver_message(self, sender, recipient, msg):
+        """Consegna un messaggio dal mittente al destinatario"""
+        timestamp = datetime.now().strftime("%H:%M")
+        
+        # Inizializza la lista messaggi per il destinatario se non esiste
+        if recipient not in self.client_messages:
+            self.client_messages[recipient] = []
+            
+        # Formato messaggio per il destinatario
+        formatted_msg = f"[{timestamp}] {sender}: {msg}"
+        self.client_messages[recipient].append(formatted_msg)
+        
+        # Sincronizza con struttura condivisa
+        if shared_servers is not None and self.server_ip in shared_servers:
+            server_data = dict(shared_servers[self.server_ip])
+            if 'client_messages' not in server_data:
+                server_data['client_messages'] = {}
+            server_data['client_messages'][recipient] = list(self.client_messages[recipient])
+            shared_servers[self.server_ip] = server_data
+        
+        # Log della consegna
+        self.add_log(f"📬 MESSAGGIO CONSEGNATO a {recipient}")
+        """Sincronizza lo stato del server con le strutture condivise"""
+        if shared_servers is not None and self.server_ip in shared_servers:
+            server_data = shared_servers[self.server_ip]
+            self.connected_clients = list(server_data['connected_clients'])
+            self.logs = list(server_data['logs'])
+            self.intercepted_messages = list(server_data['intercepted_messages'])
+            # Sincronizza anche i messaggi client
+            if 'client_messages' in server_data:
+                self.client_messages = dict(server_data['client_messages'])
+
+# --- MANAGER APP ---
+class ManagerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("🛠️ Manager Client/Server")
+        self.geometry("900x600")
+        self.configure(bg="#0d1117")
+        self.child_processes = []  # Lista per tracciare processi figli
+        init_multiprocessing()  # Inizializza il manager
+        load_db()
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)  # Gestisci chiusura
+        self.create_widgets()
+    def create_widgets(self):
+        # Header con gradiente simulato
+        header = tk.Frame(self, bg="#161b22", height=70)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        title_label = tk.Label(header, text="🛠️ Manager Client/Server", 
+                              font=("Segoe UI", 20, "bold"), bg="#161b22", fg="#58a6ff")
+        title_label.pack(pady=20)
+        
+        # Frame creazione con design moderno
+        create_container = tk.Frame(self, bg="#0d1117")
+        create_container.pack(fill="x", padx=20, pady=15)
+        
+        tk.Label(create_container, text="➕ Crea Nuova Entità", 
+                font=("Segoe UI", 13, "bold"), bg="#0d1117", fg="#c9d1d9").pack(anchor="w", pady=(0,10))
+        
+        frame = tk.Frame(create_container, bg="#161b22")
+        frame.pack(fill="x", ipady=15)
+        
+        self.type_var = tk.StringVar(value="Client")
+        
+        # Radio buttons
+        radio_frame = tk.Frame(frame, bg="#161b22")
+        radio_frame.grid(row=0, column=0, columnspan=4, pady=10, padx=10, sticky="w")
+        
+        tk.Radiobutton(radio_frame, text="👤 Client", variable=self.type_var, value="Client",
+                      bg="#161b22", fg="#c9d1d9", selectcolor="#21262d", 
+                      activebackground="#161b22", font=("Segoe UI", 10)).pack(side="left", padx=10)
+        tk.Radiobutton(radio_frame, text="🖥️ Server", variable=self.type_var, value="Server",
+                      bg="#161b22", fg="#c9d1d9", selectcolor="#21262d",
+                      activebackground="#161b22", font=("Segoe UI", 10)).pack(side="left", padx=10)
+        
+        # Campi inline
+        tk.Label(frame, text="Nome:", bg="#161b22", fg="#8b949e", font=("Segoe UI", 9)).grid(row=1, column=0, padx=(15,5), sticky="e")
+        self.name_entry = tk.Entry(frame, width=15, bg="#0d1117", fg="#c9d1d9", relief="flat", font=("Segoe UI", 10))
+        self.name_entry.grid(row=1, column=1, padx=5, ipady=4)
+        
+        tk.Label(frame, text="Password:", bg="#161b22", fg="#8b949e", font=("Segoe UI", 9)).grid(row=1, column=2, padx=5, sticky="e")
+        self.pw_entry = tk.Entry(frame, width=15, show="●", bg="#0d1117", fg="#c9d1d9", relief="flat", font=("Segoe UI", 10))
+        self.pw_entry.grid(row=1, column=3, padx=5, ipady=4)
+        
+        tk.Label(frame, text="ID/IP:", bg="#161b22", fg="#8b949e", font=("Segoe UI", 9)).grid(row=1, column=4, padx=5, sticky="e")
+        self.id_entry = tk.Entry(frame, width=15, bg="#0d1117", fg="#c9d1d9", relief="flat", font=("Segoe UI", 10))
+        self.id_entry.grid(row=1, column=5, padx=5, ipady=4)
+        
+        create_btn = tk.Button(frame, text="✓ Crea", command=self.create_entity,
+                              bg="#238636", fg="white", font=("Segoe UI", 10, "bold"),
+                              relief="flat", cursor="hand2", padx=20, pady=6)
+        create_btn.grid(row=1, column=6, padx=15)
+        
+        # Liste
+        # Liste con design moderno
+        frame_lists = tk.Frame(self, bg="#0d1117")
+        frame_lists.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        # Clients
+        left = tk.Frame(frame_lists, bg="#161b22")
+        left.pack(side="left", fill="both", expand=True, padx=(0,10))
+        
+        tk.Label(left, text="👥 Clients", font=("Segoe UI", 12, "bold"), 
+                bg="#161b22", fg="#58a6ff").pack(pady=10, padx=10, anchor="w")
+        
+        self.clients_list = tk.Listbox(left, height=10, bg="#0d1117", fg="#c9d1d9",
+                                      selectbackground="#1f6feb", selectforeground="white",
+                                      relief="flat", font=("Consolas", 10), bd=0)
+        self.clients_list.pack(fill="both", expand=True, padx=10, pady=(0,10))
+        
+        tk.Button(left, text="🗑️ Elimina", command=lambda: self.delete_entity("Client"),
+                 bg="#da3633", fg="white", font=("Segoe UI", 9),
+                 relief="flat", cursor="hand2", padx=15, pady=5).pack(pady=10)
+        
+        # Servers
+        right = tk.Frame(frame_lists, bg="#161b22")
+        right.pack(side="left", fill="both", expand=True)
+        
+        tk.Label(right, text="🖥️ Servers", font=("Segoe UI", 12, "bold"), 
+                bg="#161b22", fg="#58a6ff").pack(pady=10, padx=10, anchor="w")
+        
+        self.servers_list = tk.Listbox(right, height=10, bg="#0d1117", fg="#c9d1d9",
+                                       selectbackground="#1f6feb", selectforeground="white",
+                                       relief="flat", font=("Consolas", 10), bd=0)
+        self.servers_list.pack(fill="both", expand=True, padx=10, pady=(0,10))
+        
+        tk.Button(right, text="🗑️ Elimina", command=lambda: self.delete_entity("Server"),
+                 bg="#da3633", fg="white", font=("Segoe UI", 9),
+                 relief="flat", cursor="hand2", padx=15, pady=5).pack(pady=10)
+        
+        self.refresh_lists()
+        
+        # Avvio interfacce
+        frame_launch = tk.Frame(self, bg="#0d1117")
+        frame_launch.pack(fill="x", padx=20, pady=(0,15))
+        
+        tk.Button(frame_launch, text="▶️ Apri ServerApp", command=self.launch_server_app,
+                 bg="#1f6feb", fg="white", font=("Segoe UI", 11, "bold"),
+                 relief="flat", cursor="hand2", padx=30, pady=12).pack(side="left", padx=10, expand=True, fill="x")
+        tk.Button(frame_launch, text="▶️ Apri ClientApp", command=self.launch_client_app,
+                 bg="#1f6feb", fg="white", font=("Segoe UI", 11, "bold"),
+                 relief="flat", cursor="hand2", padx=30, pady=12).pack(side="left", padx=10, expand=True, fill="x")
+        
+    def create_entity(self):
+        tipo = self.type_var.get()
+        nome = self.name_entry.get().strip()
+        pw = self.pw_entry.get().strip()
+        idval = self.id_entry.get().strip()
+        if not nome or not pw or not idval:
+            messagebox.showerror("Errore", "Compila tutti i campi!")
+            return
+        if tipo == "Client":
+            c = Client(nome, pw, idval)
+            CLIENTS.append(c)
+        else:
+            s = Server(nome, pw, idval)
+            SERVERS.append(s)
+        save_db()
+        self.refresh_lists()
+        
+    def delete_entity(self, tipo):
+        if tipo == "Client":
+            sel = self.clients_list.curselection()
+            if sel:
+                CLIENTS.pop(sel[0])
+        else:
+            sel = self.servers_list.curselection()
+            if sel:
+                SERVERS.pop(sel[0])
+        save_db()
+        self.refresh_lists()
+        
+    def refresh_lists(self):
+        self.clients_list.delete(0, tk.END)
+        self.servers_list.delete(0, tk.END)
+        for c in CLIENTS:
+            self.clients_list.insert(tk.END, f"{c.name} [{c.client_id}]")
+        for s in SERVERS:
+            self.servers_list.insert(tk.END, f"{s.name} [{s.server_ip}]")
+            
+    def launch_server_app(self):
+        # Passa il manager ai processi figli
+        p = multiprocessing.Process(target=run_server_app, args=(shared_servers, shared_clients))
+        p.start()
+        self.child_processes.append(p)  # Traccia il processo
+        
+    def launch_client_app(self):
+        # Passa il manager ai processi figli  
+        p = multiprocessing.Process(target=run_client_app, args=(shared_servers, shared_clients))
+        p.start()
+        self.child_processes.append(p)  # Traccia il processo
+    
+    def on_closing(self):
+        """Chiude tutti i processi figli prima di chiudere il Manager"""
+        if messagebox.askokcancel("Chiudi Manager", "Chiudere il Manager chiuderà anche tutte le app Client e Server. Continuare?"):
+            # Termina tutti i processi figli
+            for p in self.child_processes:
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=2)  # Attendi max 2 secondi
+                    if p.is_alive():
+                        p.kill()  # Forza la chiusura se non risponde
+            
+            # Salva il database
+            save_db()
+            
+            # Chiudi il manager
+            self.destroy()
+
+# --- SERVER APP ---
+def run_server_app(shared_servers_param=None, shared_clients_param=None):
+    global shared_servers, shared_clients
+    if shared_servers_param is not None:
+        shared_servers = shared_servers_param
+        shared_clients = shared_clients_param
+    else:
+        init_multiprocessing()
+    load_db()
+    class ServerApp(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("🖥️ Server App")
+            self.geometry("700x600")
+            self.configure(bg="#0d1117")
+            self.server = None
+            self.logged_in = False
+            self.protocol("WM_DELETE_WINDOW", self.on_closing)  # Gestisci chiusura finestra
+            self.create_login_widgets()
+            
+        def create_login_widgets(self):
+            for widget in self.winfo_children():
+                widget.destroy()
+            
+            frame = tk.Frame(self, bg="#161b22", relief="flat")
+            frame.place(relx=0.5, rely=0.5, anchor="center")
+            
+            # Titolo con icona
+            tk.Label(frame, text="🖥️", font=("Arial", 40), bg="#161b22", fg="#58a6ff").pack(pady=(20,0))
+            tk.Label(frame, text="Server Login", font=("Segoe UI", 22, "bold"), 
+                    bg="#161b22", fg="#c9d1d9").pack(pady=(5,30))
+            
+            # Campo nome
+            tk.Label(frame, text="Nome Server", bg="#161b22", fg="#8b949e", 
+                    font=("Segoe UI", 9)).pack(anchor="w", padx=30)
+            self.login_name = tk.Entry(frame, width=30, bg="#0d1117", fg="#c9d1d9",
+                                      insertbackground="#c9d1d9", relief="flat", 
+                                      font=("Segoe UI", 11))
+            self.login_name.pack(pady=(5,15), padx=30, ipady=8)
+            
+            # Campo password
+            tk.Label(frame, text="Password", bg="#161b22", fg="#8b949e", 
+                    font=("Segoe UI", 9)).pack(anchor="w", padx=30)
+            self.login_pw = tk.Entry(frame, width=30, show="●", bg="#0d1117", fg="#c9d1d9",
+                                    insertbackground="#c9d1d9", relief="flat", 
+                                    font=("Segoe UI", 11))
+            self.login_pw.pack(pady=(5,25), padx=30, ipady=8)
+            self.login_pw.bind("<Return>", lambda e: self.login())
+            
+            # Bottone accesso
+            login_btn = tk.Button(frame, text="Accedi", command=self.login,
+                                 bg="#238636", fg="white", font=("Segoe UI", 11, "bold"),
+                                 relief="flat", cursor="hand2", width=28, pady=10,
+                                 activebackground="#2ea043", activeforeground="white")
+            login_btn.pack(pady=(0,30), padx=30)
+            
+        def login(self):
+            name = self.login_name.get().strip()
+            pw = self.login_pw.get().strip()
+            for s in SERVERS:
+                if s.name == name and s.password == pw:
+                    self.server = s
+                    self.logged_in = True
+                    self.title(f"🖥️ Server - {s.name} [{s.server_ip}]")
+                    self.create_main_widgets()
+                    self.server.add_log("Server avviato")
+                    self.server.add_log(f"Admin {name} effettua login")
+                    self.refresh_logs()
+                    # Avvia auto-refresh per aggiornamenti in tempo reale
+                    threading.Thread(target=self.auto_refresh, daemon=True).start()
+                    return
+            messagebox.showerror("Errore", "Credenziali errate!")
+            
+        def create_main_widgets(self):
+            for widget in self.winfo_children():
+                widget.destroy()
+            
+            # Header moderno
+            header = tk.Frame(self, bg="#161b22", height=80)
+            header.pack(fill="x")
+            header.pack_propagate(False)
+            
+            tk.Label(header, text="🖥️", font=("Arial", 24), bg="#161b22", fg="#58a6ff").pack(side="left", padx=20)
+            
+            info_frame = tk.Frame(header, bg="#161b22")
+            info_frame.pack(side="left", fill="both", expand=True, pady=15)
+            
+            tk.Label(info_frame, text=self.server.name, 
+                    font=("Segoe UI", 16, "bold"), bg="#161b22", fg="#c9d1d9").pack(anchor="w")
+            tk.Label(info_frame, text=f"IP: {self.server.server_ip}", 
+                    font=("Segoe UI", 10), bg="#161b22", fg="#8b949e").pack(anchor="w")
+            
+            # Notebook con stile
+            style = ttk.Style()
+            style.theme_use('default')
+            style.configure('TNotebook', background='#0d1117', borderwidth=0)
+            style.configure('TNotebook.Tab', background='#161b22', foreground='#8b949e', 
+                          padding=[20, 10], font=('Segoe UI', 10))
+            style.map('TNotebook.Tab', background=[('selected', '#0d1117')], 
+                     foreground=[('selected', '#58a6ff')])
+            
+            notebook = ttk.Notebook(self)
+            notebook.pack(fill="both", expand=True, padx=0, pady=0)
+            
+            # Tab Logs con tema scuro
+            tab_logs = tk.Frame(notebook, bg="#0d1117")
+            notebook.add(tab_logs, text="📋 Logs")
+            self.log_text = scrolledtext.ScrolledText(tab_logs, height=20, bg="#0d1117", fg="#238636", 
+                                                      font=("Consolas", 10), state="disabled", relief="flat",
+                                                      insertbackground="#c9d1d9")
+            self.log_text.pack(fill="both", expand=True, padx=15, pady=15)
+            
+            # Tab Client Connessi
+            tab_clients = tk.Frame(notebook, bg="#0d1117")
+            notebook.add(tab_clients, text="👥 Client Connessi")
+            
+            self.clients_listbox = tk.Listbox(tab_clients, height=15, bg="#0d1117", fg="#c9d1d9",
+                                             selectbackground="#1f6feb", selectforeground="white",
+                                             relief="flat", font=("Consolas", 10), bd=0)
+            self.clients_listbox.pack(fill="both", expand=True, padx=15, pady=15)
+            
+            tk.Button(tab_clients, text="❌ Disconnetti", command=self.disconnect_client,
+                     bg="#da3633", fg="white", font=("Segoe UI", 10),
+                     relief="flat", cursor="hand2", padx=20, pady=8).pack(pady=(0,15))
+            
+            # Tab Messaggi Intercettati
+            tab_msgs = tk.Frame(notebook, bg="#0d1117")
+            notebook.add(tab_msgs, text="📨 Messaggi Intercettati")
+            self.msgs_text = scrolledtext.ScrolledText(tab_msgs, height=20, bg="#0d1117", fg="#f0883e", 
+                                                       font=("Consolas", 10), state="disabled", relief="flat",
+                                                       insertbackground="#c9d1d9")
+            self.msgs_text.pack(fill="both", expand=True, padx=15, pady=15)
+            
+            self.refresh_all()
+            
+        def on_closing(self):
+            """Gestisce la chiusura della finestra server"""
+            if self.logged_in and self.server:
+                try:
+                    # Segnala che il server si sta chiudendo nella struttura condivisa
+                    if shared_servers is not None and self.server.server_ip in shared_servers:
+                        server_data = dict(shared_servers[self.server.server_ip])
+                        server_data['server_status'] = 'offline'  # Segnala che il server è offline
+                        self.server.add_log(f"⚠️ SERVER SHUTDOWN: Chiusura server in corso...")
+                        self.server.add_log(f"Tutti i client verranno disconnessi")
+                        server_data['logs'] = list(self.server.logs)
+                        shared_servers[self.server.server_ip] = server_data
+                except (BrokenPipeError, EOFError, ConnectionResetError):
+                    # Manager già chiuso, ignora l'errore
+                    pass
+                
+                # Ferma il thread di auto-refresh
+                self.logged_in = False
+                time.sleep(0.3)  # Attendi che il thread termini
+            
+            # Chiudi la finestra
+            self.destroy()
+            
+        def refresh_logs(self):
+            if not self.logged_in:
+                return
+                
+            # Sincronizza con struttura condivisa
+            if shared_servers is not None and self.server.server_ip in shared_servers:
+                server_data = shared_servers[self.server.server_ip]
+                self.server.logs = list(server_data['logs'])
+                
+            self.log_text.config(state="normal")
+            self.log_text.delete(1.0, tk.END)
+            for log in self.server.logs:
+                self.log_text.insert(tk.END, log + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state="disabled")
+            
+        def refresh_clients(self):
+            if not self.logged_in:
+                return
+            
+            # Salva la selezione corrente
+            current_selection = self.clients_listbox.curselection()
+            current_index = current_selection[0] if current_selection else None
+            
+            # Sincronizza con struttura condivisa
+            if shared_servers is not None and self.server.server_ip in shared_servers:
+                server_data = shared_servers[self.server.server_ip]
+                self.server.connected_clients = list(server_data['connected_clients'])
+                self.server.logs = list(server_data['logs'])
+                self.server.intercepted_messages = list(server_data['intercepted_messages'])
+            
+            self.clients_listbox.delete(0, tk.END)
+            for client in self.server.connected_clients:
+                self.clients_listbox.insert(tk.END, f"{client['name']} [{client['id']}]")
+            
+            # Ripristina la selezione se possibile
+            if current_index is not None and current_index < self.clients_listbox.size():
+                self.clients_listbox.selection_set(current_index)
+                
+        def refresh_messages(self):
+            if not self.logged_in:
+                return
+            self.msgs_text.config(state="normal")
+            self.msgs_text.delete(1.0, tk.END)
+            for msg in self.server.intercepted_messages:
+                self.msgs_text.insert(tk.END, msg + "\n")
+            self.msgs_text.see(tk.END)
+            self.msgs_text.config(state="disabled")
+            
+        def refresh_all(self):
+            self.refresh_logs()
+            self.refresh_clients()
+            self.refresh_messages()
+            
+        def auto_refresh(self):
+            """Auto-refresh continuo ogni secondo per aggiornamenti in tempo reale"""
+            while self.logged_in:
+                try:
+                    if hasattr(self, 'log_text'):  # Assicurati che i widget esistano
+                        self.refresh_all()
+                    time.sleep(1)
+                except:
+                    break
+                
+        def disconnect_client(self):
+            sel = self.clients_listbox.curselection()
+            if sel:
+                client_name = self.clients_listbox.get(sel[0]).split(' [')[0]
+                
+                # Rimuovi dalla struttura condivisa
+                if shared_servers is not None and self.server.server_ip in shared_servers:
+                    server_data = shared_servers[self.server.server_ip]
+                    server_data['connected_clients'] = [c for c in server_data['connected_clients'] 
+                                                       if c["name"] != client_name]
+                    
+                    # Aggiungi log
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    log_entry = f"[{timestamp}] Client {client_name} disconnesso dall'admin"
+                    server_data['logs'].append(log_entry)
+                    
+                    # Salva modifiche
+                    shared_servers[self.server.server_ip] = server_data
+                
+                self.refresh_all()
+                
+    app = ServerApp()
+    app.mainloop()
+
+# --- CLIENT APP ---
+def run_client_app(shared_servers_param=None, shared_clients_param=None):
+    global shared_servers, shared_clients
+    if shared_servers_param is not None:
+        shared_servers = shared_servers_param
+        shared_clients = shared_clients_param
+    else:
+        init_multiprocessing()
+    load_db()
+    class ClientApp(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("📱 Client App")
+            self.geometry("700x600")
+            self.configure(bg="#0d1117")
+            self.client = None
+            self.server = None
+            self.logged_in = False
+            self.connected_to_server = False
+            self.chats = {}  # {recipient_name: [messages]}
+            self.unread_counts = {}  # {recipient_name: count}
+            self.current_chat = None
+            self.protocol("WM_DELETE_WINDOW", self.on_closing)  # Gestisci chiusura finestra
+            self.create_login_widgets()
+            
+        def create_login_widgets(self):
+            for widget in self.winfo_children():
+                widget.destroy()
+            
+            frame = tk.Frame(self, bg="#161b22", relief="flat")
+            frame.place(relx=0.5, rely=0.5, anchor="center")
+            
+            # Titolo con icona
+            tk.Label(frame, text="📱", font=("Arial", 40), bg="#161b22", fg="#58a6ff").pack(pady=(20,0))
+            tk.Label(frame, text="Client Login", font=("Segoe UI", 22, "bold"), 
+                    bg="#161b22", fg="#c9d1d9").pack(pady=(5,30))
+            
+            # Campo nome
+            tk.Label(frame, text="Nome Client", bg="#161b22", fg="#8b949e", 
+                    font=("Segoe UI", 9)).pack(anchor="w", padx=30)
+            self.login_name = tk.Entry(frame, width=30, bg="#0d1117", fg="#c9d1d9",
+                                      insertbackground="#c9d1d9", relief="flat", 
+                                      font=("Segoe UI", 11))
+            self.login_name.pack(pady=(5,15), padx=30, ipady=8)
+            
+            # Campo password
+            tk.Label(frame, text="Password", bg="#161b22", fg="#8b949e", 
+                    font=("Segoe UI", 9)).pack(anchor="w", padx=30)
+            self.login_pw = tk.Entry(frame, width=30, show="●", bg="#0d1117", fg="#c9d1d9",
+                                    insertbackground="#c9d1d9", relief="flat", 
+                                    font=("Segoe UI", 11))
+            self.login_pw.pack(pady=(5,25), padx=30, ipady=8)
+            self.login_pw.bind("<Return>", lambda e: self.login())
+            
+            # Bottone accesso
+            login_btn = tk.Button(frame, text="Accedi", command=self.login,
+                                 bg="#238636", fg="white", font=("Segoe UI", 11, "bold"),
+                                 relief="flat", cursor="hand2", width=28, pady=10,
+                                 activebackground="#2ea043", activeforeground="white")
+            login_btn.pack(pady=(0,30), padx=30)
+            
+        def login(self):
+            name = self.login_name.get().strip()
+            pw = self.login_pw.get().strip()
+            for c in CLIENTS:
+                if c.name == name and c.password == pw:
+                    self.client = c
+                    self.logged_in = True
+                    self.title(f"📱 Client - {c.name}")
+                    self.create_main_widgets()
+                    return
+            messagebox.showerror("Errore", "Credenziali errate!")
+            
+        def create_main_widgets(self):
+            for widget in self.winfo_children():
+                widget.destroy()
+            
+            # Header moderno
+            header = tk.Frame(self, bg="#161b22", height=70)
+            header.pack(fill="x")
+            header.pack_propagate(False)
+            
+            tk.Label(header, text="📱", font=("Arial", 20), bg="#161b22", fg="#58a6ff").pack(side="left", padx=15)
+            
+            info_frame = tk.Frame(header, bg="#161b22")
+            info_frame.pack(side="left", fill="both", expand=True, pady=12)
+            
+            tk.Label(info_frame, text=self.client.name, 
+                    font=("Segoe UI", 14, "bold"), bg="#161b22", fg="#c9d1d9").pack(anchor="w")
+            tk.Label(info_frame, text=f"ID: {self.client.client_id}", 
+                    font=("Segoe UI", 9), bg="#161b22", fg="#8b949e").pack(anchor="w")
+            
+            self.status_label = tk.Label(header, text="❌ Non connesso", font=("Segoe UI", 10), 
+                                        bg="#161b22", fg="#da3633")
+            self.status_label.pack(side="right", padx=20)
+            
+            # Frame connessione server con tema scuro
+            frame_conn = tk.Frame(self, bg="#0d1117")
+            frame_conn.pack(fill="x", padx=20, pady=15)
+            
+            tk.Label(frame_conn, text="Server IP:", bg="#0d1117", fg="#8b949e", 
+                    font=("Segoe UI", 10)).pack(side="left", padx=5)
+            
+            self.server_ip_var = tk.StringVar()
+            self.server_combo = ttk.Combobox(frame_conn, textvariable=self.server_ip_var, 
+                                            width=18, state="readonly", font=("Segoe UI", 10))
+            self.server_combo['values'] = [s.server_ip for s in SERVERS]
+            if SERVERS:
+                self.server_combo.current(0)
+            self.server_combo.pack(side="left", padx=5)
+            
+            tk.Button(frame_conn, text="🔗 Connetti", command=self.connect_server,
+                     bg="#238636", fg="white", font=("Segoe UI", 9),
+                     relief="flat", cursor="hand2", padx=12, pady=6).pack(side="left", padx=5)
+            tk.Button(frame_conn, text="❌ Disconnetti", command=self.disconnect_server,
+                     bg="#da3633", fg="white", font=("Segoe UI", 9),
+                     relief="flat", cursor="hand2", padx=12, pady=6).pack(side="left", padx=5)
+            
+            # Frame principale con chat
+            main_frame = tk.Frame(self, bg="#0d1117")
+            main_frame.pack(fill="both", expand=True, padx=20, pady=(0,15))
+            
+            # Lista chat (sinistra) con tema moderno
+            left_frame = tk.Frame(main_frame, bg="#161b22", width=220)
+            left_frame.pack(side="left", fill="y", padx=(0,15))
+            left_frame.pack_propagate(False)
+            
+            tk.Label(left_frame, text="💬 Chat", font=("Segoe UI", 13, "bold"), 
+                    bg="#161b22", fg="#58a6ff").pack(pady=12, padx=10, anchor="w")
+            
+            self.chat_listbox = tk.Listbox(left_frame, bg="#0d1117", fg="#c9d1d9",
+                                          selectbackground="#1f6feb", selectforeground="white",
+                                          relief="flat", font=("Segoe UI", 10), bd=0, width=25)
+            self.chat_listbox.pack(fill="both", expand=True, padx=10, pady=(0,10))
+            self.chat_listbox.bind("<<ListboxSelect>>", self.select_chat)
+            
+            # Nuova chat
+            new_chat_frame = tk.Frame(left_frame, bg="#161b22")
+            new_chat_frame.pack(fill="x", padx=10, pady=12)
+            
+            self.new_chat_entry = tk.Entry(new_chat_frame, bg="#0d1117", fg="#c9d1d9",
+                                          insertbackground="#c9d1d9", relief="flat", 
+                                          font=("Segoe UI", 9), width=15)
+            self.new_chat_entry.pack(side="left", ipady=4, fill="x", expand=True)
+            
+            tk.Button(new_chat_frame, text="➕", command=self.create_chat,
+                     bg="#238636", fg="white", font=("Segoe UI", 10, "bold"),
+                     relief="flat", cursor="hand2", width=3).pack(side="left", padx=(5,0))
+            
+            # Area chat (destra) con tema scuro
+            right_frame = tk.Frame(main_frame, bg="#161b22")
+            right_frame.pack(side="left", fill="both", expand=True)
+            
+            self.chat_name_label = tk.Label(right_frame, text="Seleziona una chat", 
+                                           font=("Segoe UI", 12, "bold"), 
+                                           bg="#21262d", fg="#c9d1d9", pady=12)
+            self.chat_name_label.pack(fill="x")
+            
+            self.chat_text = scrolledtext.ScrolledText(right_frame, height=15, bg="#0d1117", fg="#c9d1d9", 
+                                                       font=("Segoe UI", 10), state="disabled", relief="flat",
+                                                       insertbackground="#c9d1d9")
+            self.chat_text.pack(fill="both", expand=True, padx=10, pady=10)
+            
+            # Input messaggio con tema moderno
+            msg_frame = tk.Frame(right_frame, bg="#161b22")
+            msg_frame.pack(fill="x", padx=10, pady=10)
+            
+            self.msg_entry = tk.Entry(msg_frame, bg="#0d1117", fg="#c9d1d9",
+                                     insertbackground="#c9d1d9", relief="flat", 
+                                     font=("Segoe UI", 10))
+            self.msg_entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0,8))
+            self.msg_entry.bind("<Return>", lambda e: self.send_message())
+            
+            tk.Button(msg_frame, text="📤 Invia", command=self.send_message,
+                     bg="#1f6feb", fg="white", font=("Segoe UI", 10, "bold"),
+                     relief="flat", cursor="hand2", padx=20, pady=8).pack(side="right")
+        def connect_server(self):
+            if not self.logged_in:
+                return
+            ip = self.server_ip_var.get()
+            if not ip:
+                messagebox.showerror("Errore", "Seleziona un server!")
+                return
+                
+            # Trova il server nella lista locale
+            for s in SERVERS:
+                if s.server_ip == ip:
+                    self.server = s
+                    self.connected_to_server = True
+                    self.status_label.config(text=f"✅ Connesso a {s.name}", fg="#44ff44")
+                    
+                    # Prima sincronizza con la struttura condivisa per ottenere la lista aggiornata
+                    if shared_servers is not None:
+                        if ip in shared_servers:
+                            # Il server esiste già, sincronizza i dati
+                            server_data = dict(shared_servers[ip])
+                            s.connected_clients = list(server_data['connected_clients'])
+                            s.logs = list(server_data['logs'])
+                            s.intercepted_messages = list(server_data['intercepted_messages'])
+                        else:
+                            # Il server non esiste, inizializzalo
+                            shared_servers[ip] = {
+                                'name': s.name,
+                                'password': s.password,
+                                'server_ip': s.server_ip,
+                                'connected_clients': [],
+                                'logs': [],
+                                'intercepted_messages': [],
+                                'client_messages': {},  # Dizionario per messaggi per client
+                                'server_status': 'online'
+                            }
+                    
+                    # Aggiungi client alla lista locale del server (se non già presente)
+                    client_info = {"name": self.client.name, "id": self.client.client_id}
+                    if not any(c["id"] == self.client.client_id for c in s.connected_clients):
+                        s.connected_clients.append(client_info)
+                        
+                        # Log dettagliati
+                        s.add_log(f">>> CONNESSIONE: Client {self.client.name} [{self.client.client_id}] si è connesso")
+                        s.add_log(f"Totale client connessi: {len(s.connected_clients)}")
+                        
+                        # Aggiorna la struttura condivisa con la nuova lista
+                        if shared_servers is not None:
+                            server_data = dict(shared_servers[ip])
+                            server_data['connected_clients'] = [dict(c) for c in s.connected_clients]
+                            server_data['logs'] = list(s.logs)
+                            shared_servers[ip] = server_data
+                    # Aggiorna lista chat con client connessi
+                    self.update_available_chats()
+                    
+                    # Avvia thread per aggiornamenti automatici
+                    threading.Thread(target=self.auto_refresh_chats, daemon=True).start()
+                    return
+            messagebox.showerror("Errore", "Server non trovato!")
+            
+        def disconnect_server(self):
+            if self.server and self.client:
+                # Prima sincronizza con la struttura condivisa per avere la lista aggiornata
+                if shared_servers is not None and self.server.server_ip in shared_servers:
+                    server_data = dict(shared_servers[self.server.server_ip])
+                    self.server.connected_clients = list(server_data['connected_clients'])
+                    self.server.logs = list(server_data['logs'])
+                
+                # Rimuovi dalla lista locale del server
+                self.server.connected_clients = [c for c in self.server.connected_clients 
+                                                 if c["id"] != self.client.client_id]
+                self.server.add_log(f"<<< DISCONNESSIONE: Client {self.client.name} [{self.client.client_id}] si è disconnesso")
+                self.server.add_log(f"Totale client connessi: {len(self.server.connected_clients)}")
+                
+                # Aggiorna la struttura condivisa con la nuova lista
+                if shared_servers is not None and self.server.server_ip in shared_servers:
+                    server_data = dict(shared_servers[self.server.server_ip])
+                    server_data['connected_clients'] = [dict(c) for c in self.server.connected_clients]
+                    server_data['logs'] = list(self.server.logs)
+                    shared_servers[self.server.server_ip] = server_data
+                
+                self.server = None
+                self.connected_to_server = False
+                
+                # Aggiorna il label dello status se esiste
+                if hasattr(self, 'status_label'):
+                    self.status_label.config(text="❌ Non connesso", fg="#da3633")
+                
+                # Rimuovi gli indicatori online dalle chat ma mantieni le chat esistenti
+                for i in range(self.chat_listbox.size()):
+                    chat_name = self.chat_listbox.get(i).replace(" 🟢", "").replace(" 🔔", "").strip()
+                    unread_indicator = " 🔔" if self.unread_counts.get(chat_name, 0) > 0 else ""
+                    display_text = f"{chat_name}{unread_indicator}"
+                    self.chat_listbox.delete(i)
+                    self.chat_listbox.insert(i, display_text)
+        def create_chat(self):
+            recipient = self.new_chat_entry.get().strip()
+            if not recipient:
+                return
+            if recipient not in self.chats:
+                self.chats[recipient] = []
+                self.chat_listbox.insert(tk.END, recipient)
+                if self.server:
+                    self.server.add_log(f"Chat creata: {self.client.name} ha aperto una chat con {recipient}")
+            self.new_chat_entry.delete(0, tk.END)
+            
+        def update_available_chats(self):
+            """Aggiorna la lista delle chat disponibili con i client connessi al server"""
+            if not self.server or not self.connected_to_server:
+                return
+            
+            # Sincronizza prima con la struttura condivisa per ottenere la lista aggiornata
+            if shared_servers is not None and self.server.server_ip in shared_servers:
+                server_data = dict(shared_servers[self.server.server_ip])
+                self.server.connected_clients = list(server_data['connected_clients'])
+            
+            # Ottieni lista client connessi (escludi te stesso)
+            available_clients = [c["name"] for c in self.server.connected_clients 
+                               if c["name"] != self.client.name]
+            
+            # Salva la selezione corrente
+            current_selection = self.chat_listbox.curselection()
+            selected_chat = None
+            if current_selection:
+                selected_chat = self.chat_listbox.get(current_selection[0]).replace(" 🟢", "").replace(" 🔔", "").strip()
+            
+            # Ottieni tutte le chat esistenti (anche quelle con messaggi salvati)
+            all_chat_names = set(self.chats.keys())
+            
+            # Aggiungi nuovi client disponibili alle chat se non già presenti
+            for client_name in available_clients:
+                if client_name not in self.chats:
+                    self.chats[client_name] = []
+                if client_name not in self.unread_counts:
+                    self.unread_counts[client_name] = 0
+                all_chat_names.add(client_name)
+            
+            # Ricostruisci completamente la listbox preservando tutte le chat
+            self.chat_listbox.delete(0, tk.END)
+            
+            # Aggiungi tutte le chat con indicatori appropriati
+            for chat_name in sorted(all_chat_names):
+                online_indicator = " 🟢" if chat_name in available_clients else ""
+                unread_indicator = " 🔔" if self.unread_counts.get(chat_name, 0) > 0 else ""
+                display_text = f"{chat_name}{online_indicator}{unread_indicator}"
+                self.chat_listbox.insert(tk.END, display_text)
+            
+            # Ripristina la selezione se possibile
+            if selected_chat:
+                for i in range(self.chat_listbox.size()):
+                    chat_name = self.chat_listbox.get(i).replace(" 🟢", "").replace(" 🔔", "").strip()
+                    if chat_name == selected_chat:
+                        self.chat_listbox.selection_set(i)
+                        break
+                    
+        def check_received_messages(self):
+            """Controlla se ci sono nuovi messaggi per questo client"""
+            if not self.server or not self.connected_to_server:
+                return
+                
+            # Sincronizza con la struttura condivisa
+            if shared_servers is not None and self.server.server_ip in shared_servers:
+                server_data = dict(shared_servers[self.server.server_ip])
+                if 'client_messages' in server_data and self.client.name in server_data['client_messages']:
+                    # Ottieni messaggi per questo client
+                    received_messages = server_data['client_messages'][self.client.name]
+                    
+                    # Aggiungi nuovi messaggi alle chat appropriate
+                    for msg in received_messages:
+                        # Estrai il mittente dal messaggio (formato: "[timestamp] mittente: contenuto")
+                        try:
+                            # Trova il mittente nel messaggio
+                            start = msg.find("] ") + 2
+                            end = msg.find(": ")
+                            if start > 1 and end > start:
+                                sender = msg[start:end]
+                                
+                                # Assicurati che la chat esista
+                                if sender not in self.chats:
+                                    self.chats[sender] = []
+                                
+                                # Aggiungi il messaggio se non c'è già
+                                if msg not in self.chats[sender]:
+                                    self.chats[sender].append(msg)
+                                    
+                                    # Se questa è la chat attiva, aggiorna la visualizzazione
+                                    if hasattr(self, 'current_chat') and self.current_chat:
+                                        clean_current = self.current_chat.replace(" 🟢", "").replace(" 🔔", "").strip()
+                                        if clean_current == sender:
+                                            self.refresh_chat()
+                                        else:
+                                            # Incrementa contatore messaggi non letti
+                                            if sender not in self.unread_counts:
+                                                self.unread_counts[sender] = 0
+                                            self.unread_counts[sender] += 1
+                                    else:
+                                        # Incrementa contatore se nessuna chat è aperta
+                                        if sender not in self.unread_counts:
+                                            self.unread_counts[sender] = 0
+                                        self.unread_counts[sender] += 1
+                        except:
+                            pass  # Ignora errori di parsing
+                    
+                    # Pulisci i messaggi dalla struttura condivisa per evitare duplicati
+                    server_data['client_messages'][self.client.name] = []
+                    shared_servers[self.server.server_ip] = server_data
+                    
+        def auto_refresh_chats(self):
+            """Thread per aggiornamento automatico delle chat disponibili"""
+            while self.connected_to_server and self.server and self.logged_in:
+                time.sleep(1)  # Aggiorna ogni secondo per essere più reattivo
+                try:
+                    # Controlla se il server è ancora online
+                    if shared_servers is not None and self.server.server_ip in shared_servers:
+                        server_data = dict(shared_servers[self.server.server_ip])
+                        if server_data.get('server_status') == 'offline':
+                            # Server disconnesso, notifica l'utente
+                            self.connected_to_server = False
+                            messagebox.showwarning(
+                                "Server Disconnesso",
+                                f"Il server {self.server.name} si è disconnesso.\nSarai disconnesso automaticamente."
+                            )
+                            if hasattr(self, 'status_label'):
+                                self.status_label.config(text="❌ Server offline", fg="#ff4444")
+                            break
+                    
+                    self.update_available_chats()
+                    self.check_received_messages()  # Controlla nuovi messaggi
+                except:
+                    break
+                    
+        def send_message(self):
+            if not self.current_chat:
+                messagebox.showwarning("Attenzione", "Seleziona una chat!")
+                return
+            if not self.connected_to_server:
+                messagebox.showerror("Errore", "Devi connetterti a un server!")
+                return
+            msg = self.msg_entry.get().strip()
+            if not msg:
+                return
+            
+            # Pulisci il nome della chat (rimuovi indicatori)
+            recipient = self.current_chat.replace(" 🟢", "").strip()
+            
+            # Assicurati che la chiave esista nel dizionario chat
+            if recipient not in self.chats:
+                self.chats[recipient] = []
+            
+            timestamp = datetime.now().strftime("%H:%M")
+            formatted_msg = f"[{timestamp}] Tu: {msg}"
+            self.chats[recipient].append(formatted_msg)
+            self.refresh_chat()
+            
+            # Log dettagliati sul server e consegna messaggio
+            if self.server:
+                self.server.add_message(self.client.name, recipient, msg)
+                self.server.deliver_message(self.client.name, recipient, msg)  # Consegna al destinatario
+                self.server.add_log(f"📨 MESSAGGIO INTERCETTATO")
+                self.server.add_log(f"   Mittente: {self.client.name} [{self.client.client_id}]")
+                self.server.add_log(f"   Destinatario: {recipient}")
+                self.server.add_log(f"   Contenuto: {msg[:50]}{'...' if len(msg) > 50 else ''}")
+                self.server.add_log(f"   Lunghezza: {len(msg)} caratteri")
+            
+            self.msg_entry.delete(0, tk.END)
+            
+        def select_chat(self, event):
+            sel = self.chat_listbox.curselection()
+            if sel:
+                self.current_chat = self.chat_listbox.get(sel[0])
+                # Mostra il nome pulito nel label
+                clean_name = self.current_chat.replace(" 🟢", "").replace(" 🔔", "").strip()
+                self.chat_name_label.config(text=f"💬 Chat con {clean_name}")
+                
+                # Azzera il contatore dei messaggi non letti
+                if clean_name in self.unread_counts:
+                    self.unread_counts[clean_name] = 0
+                
+                self.refresh_chat()
+                # Aggiorna la lista per rimuovere l'indicatore
+                self.update_available_chats()
+                
+        def on_closing(self):
+            """Gestisce la chiusura della finestra client"""
+            # Disconnetti dal server se connesso
+            if self.connected_to_server and self.server:
+                try:
+                    self.disconnect_server()
+                except (BrokenPipeError, EOFError, ConnectionResetError):
+                    # Manager già chiuso, ignora l'errore
+                    pass
+            # Chiudi la finestra
+            self.destroy()
+            
+        def refresh_chat(self):
+            if not self.current_chat:
+                return
+            
+            # Pulisci il nome della chat (rimuovi indicatori)
+            clean_name = self.current_chat.replace(" 🟢", "").replace(" 🔔", "").strip()
+            
+            # Assicurati che la chiave esista
+            if clean_name not in self.chats:
+                self.chats[clean_name] = []
+            
+            self.chat_text.config(state="normal")
+            self.chat_text.delete(1.0, tk.END)
+            for message in self.chats[clean_name]:
+                self.chat_text.insert(tk.END, message + "\n")
+            self.chat_text.see(tk.END)
+            self.chat_text.config(state="disabled")
+            
+    app = ClientApp()
+    app.mainloop()
+
+if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn')
+    ManagerApp().mainloop()
+

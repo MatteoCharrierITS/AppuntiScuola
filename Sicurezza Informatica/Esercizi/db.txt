@@ -1,0 +1,21 @@
+{
+  "clients": [
+    {
+      "name": "1",
+      "password": "1",
+      "client_id": "01"
+    },
+    {
+      "name": "2",
+      "password": "2",
+      "client_id": "02"
+    }
+  ],
+  "servers": [
+    {
+      "name": "s",
+      "password": "s",
+      "server_ip": "0"
+    }
+  ]
+}
